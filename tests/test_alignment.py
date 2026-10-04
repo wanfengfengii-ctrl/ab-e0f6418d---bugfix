@@ -218,6 +218,81 @@ class ExactAlignmentTests(unittest.TestCase):
         self.assertFalse(res2["feasible"])
 
 
+class TieBreakRegressionTests(unittest.TestCase):
+    """多级目标全部并列时的规范裁决（缺陷回归用例）。"""
+
+    REF = [0, 1, 2, 3, 4, 5, 6, 7]
+    OBS = [2, 4, 2, -1, -1, 8, 9, 5, 0]
+
+    def test_reported_equal_residual_case(self) -> None:
+        # 漂移固定 0、残差上限 7、停留 1-3、禁止跳过：存在 8 个无跳过
+        # 合法对齐，残差和 28、最大残差 7 全部相同；必须由边界字典序
+        # 裁决出规范结果 (1,2,3,4,5,6,8)，而非 (1,2,4,5,6,7,8)。
+        res = solve_alignment(self.REF, self.OBS, 0, 0, 7, 1, 3, 0)
+        self.assertTrue(res["feasible"])
+        self.assertEqual(res["num_skips"], 0)
+        self.assertEqual(res["residual_sum"], 28)
+        self.assertEqual(res["max_abs_residual"], 7)
+        self.assertEqual(res["boundaries"], [1, 2, 3, 4, 5, 6, 8])
+        self.assertEqual(
+            [lv["dwell"] for lv in res["levels"]],
+            [1, 1, 1, 1, 1, 1, 2, 1],
+        )
+        covered = [
+            s["index"] for lv in res["levels"] for s in lv["samples"]
+        ]
+        self.assertEqual(covered, list(range(len(self.OBS))))
+
+    def test_reported_case_via_http_payload_order(self) -> None:
+        # 与验收请求相同的参数（全部位置/关键字口径），结果必须稳定。
+        res = solve_alignment(
+            reference=self.REF,
+            observations=self.OBS,
+            drift_min=0,
+            drift_max=0,
+            residual_limit=7,
+            dwell_min=1,
+            dwell_max=3,
+            max_skips=0,
+        )
+        self.assertEqual(res["boundaries"], [1, 2, 3, 4, 5, 6, 8])
+
+    def test_prefix_max_can_be_tied_later(self) -> None:
+        # 构造性说明：前缀最大残差更大但边界字典序更小的方案，可能被
+        # 末尾更大的残差追平；此时字典序小者必须获胜（本缺陷的机理）。
+        # 这里直接复用报告用例并枚举全部合法对齐做独立核对。
+        res = solve_alignment(self.REF, self.OBS, 0, 0, 7, 1, 3, 0)
+        canonical = None
+        for dwells in itertools.product(range(1, 4), repeat=8):
+            if sum(dwells) != 9:
+                continue
+            total = worst = 0
+            ok = True
+            start = 0
+            for ri, L in enumerate(dwells):
+                level = self.REF[ri]
+                for t in range(start, start + L):
+                    ar = abs(self.OBS[t] - level)
+                    if ar > 7:
+                        ok = False
+                        break
+                    total += ar
+                    worst = max(worst, ar)
+                if not ok:
+                    break
+                start += L
+            if not ok:
+                continue
+            bounds = tuple(itertools.accumulate(dwells))[:-1]
+            cost = (0, total, worst, 0, bounds)
+            if canonical is None or cost < canonical[0]:
+                canonical = (cost, dwells)
+        self.assertIsNotNone(canonical)
+        self.assertEqual(
+            res["boundaries"], list(canonical[0][4])
+        )
+
+
 class ObjectiveOrderTests(unittest.TestCase):
     def test_minimize_skips_first(self) -> None:
         # 无跳过对齐需要较大残差；带 1 跳过残差为 0。
@@ -453,6 +528,65 @@ class BruteForceComparisonTests(unittest.TestCase):
             if sum(parts) == n:
                 return parts
         return None
+
+
+class TieHeavyBruteForceTests(unittest.TestCase):
+    """重复电平/小值域下的并列裁决：DP 必须与穷举完全一致。
+
+    覆盖不同漂移范围、允许跳过数与停留长度组合，以及可行/无解混合。
+    """
+
+    def test_tie_heavy_random_cases(self) -> None:
+        rng = random.Random(20261004)
+        for trial in range(400):
+            R = rng.randint(8, 10)
+            N = rng.randint(8, 15)
+            # 极小值域：大量重复参考电平与相同残差，制造多级并列。
+            ref = [rng.randint(0, 3) for _ in range(R)]
+            obs = [rng.randint(-2, 5) for _ in range(N)]
+            d_lo = -rng.randint(0, 4)
+            d_hi = rng.randint(0, 4)
+            limit = rng.choice([0, 0, 1, 1, 2, 3, 5])
+            dwell_min = rng.choice([1, 1, 1, 2])
+            dwell_max = rng.choice([1, 2, 2, 3])
+            if dwell_min > dwell_max:
+                dwell_min, dwell_max = dwell_max, dwell_min
+            max_skips = rng.choice([0, 0, 1, 2])
+            with self.subTest(
+                trial=trial,
+                ref=ref,
+                obs=obs,
+                lo=d_lo,
+                hi=d_hi,
+                limit=limit,
+                dwell=(dwell_min, dwell_max),
+                max_skips=max_skips,
+            ):
+                _assert_matches_brute(
+                    self,
+                    ref,
+                    obs,
+                    d_lo,
+                    d_hi,
+                    limit,
+                    dwell_min,
+                    dwell_max,
+                    max_skips,
+                )
+
+    def test_wide_drift_ties(self) -> None:
+        # 宽漂移范围 + 重复电平：验证漂移平局取小者与预筛不丢解。
+        rng = random.Random(77)
+        for trial in range(60):
+            R = rng.randint(8, 10)
+            N = rng.randint(8, 14)
+            ref = [rng.choice([0, 5, 10]) for _ in range(R)]
+            obs = [rng.choice([0, 5, 10]) for _ in range(N)]
+            _assert_matches_brute(
+                self, ref, obs, -50, 50,
+                rng.choice([0, 1, 2, 60]),
+                1, 3, rng.choice([0, 1, 2]),
+            )
 
 
 class WideDriftRandomTests(unittest.TestCase):

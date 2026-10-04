@@ -28,24 +28,44 @@
 2. 残差绝对值总和；
 3. 最大残差；
 4. 漂移 d；
-5. 边界序列（``s_1, ..., s_{k-1}``）字典序。
+5. 边界序列（``s_1, ..., s_{k-1}``）字典序；
+6. 以上全部相同时（仅可能出现在重复参考电平上），被跳过参考索引
+   元组的字典序——仅用于在响应完全等价的方案间给出确定性规范结果。
 
-实现要点
-========
+分阶段动态规划
+==============
 
-* **逐漂移 DP**：漂移必须沿整条路径一致，因此对每个候选整数漂移
-  独立做一次 DP。``grid[j][i]`` 表示观测前缀 ``O[0..j)`` 恰好在参考
-  电平 R[i] 结束时的最优代价；首级必须是 R[0]，末级必须是 R[R-1]，
-  首尾因此强制必用。因最多 2 个内部跳过，前驱只需考虑 i-1/i-2/i-3。
+第 3 项目标（最大残差）是**单调但不可加**的聚合量：一个前缀最大残差
+更大的方案，仍可能被后续更大的块残差追平，此后应由边界字典序裁决。
+因此不能像可加代价那样在每个 DP 状态只保留一个最优前缀，否则会把
+字典序更小的全局最优前缀提前剪去。本实现严格按目标优先级分阶段求解：
+
+* **阶段 A（跳过数、残差和）**：两者均可加。逐漂移做 DP，
+  ``grid[j][i]`` 为 ``{采用级数 q: 最小残差和}``，得到全局最优
+  跳过数 S* 与残差和 T*（跨全部漂移取最优）。
+* **阶段 B（最大残差、漂移）**：只在跳过数=S*、残差和=T* 的方案中
+  比较。逐漂移维护 ``{q: {前缀残差和: 最小前缀最大残差}}``——前缀和
+  不同的方案需要不同的后缀和来凑够 T*，彼此不可支配，故按前缀和
+  分桶，每桶只留最小前缀最大。漂移按升序枚举并以当前最优最大残差
+  严格剪枝（平局归更小漂移）；进入精确 DP 前先跑一遍无残差和约束
+  的最大残差 DP 取得合法下界，下界不优于当前最优的漂移整体跳过。
+* **阶段 C（边界字典序）**：固定漂移 D*、S*、T*、M*，逐
+  ``{q: {前缀残差和: (前缀最大, 边界编码) 的 Pareto 前沿}}`` 扩展，
+  仅保留前缀最大不超过 M* 的方案，最终取最小边界编码；节点保留
+  前驱指针用于回溯采用电平与各级停留。边界均在 1..60，以 64 为基
+  编码为单个整数，同级数下整数大小次序即边界序列字典序。
+
+阶段 B/C 还用一个**放宽的后缀最小残差和**（记忆化，允许任意不超过
+上限的跳过、不计级数）作为下界，前缀和 + 后缀下界 > T* 的状态直接
+丢弃；放宽保证它是合法下界，不会误删可行方案。
+
+其它实现要点：
+
 * **块可行区间预计算**：对采样块 [j-L, j) 归属 R[i]，令
   c_t = O[t] - R[i]，可行漂移为整数闭区间
-  ``[max c_t - lim, min c_t + lim]``，与漂移无关，只算一次；
-  每漂移仅做一次整数包含判断与至多 3 个残差的统计。
-* **首末级预筛**：任何完整对齐都必须让首级（含前 dwell_min 个观测）
-  与末级块可行，取两者可行区间并集的交集再枚举漂移。
-* **边界序列编码**：边界均在 1..60，以 64 为基编码为单个整数，
-  同级数（同跳过数）下整数大小次序恰为边界序列字典序，
-  追加边界即 ``code = code * 64 + j``。
+  ``[max c_t - lim, min c_t + lim]``，与漂移无关，只算一次。
+* **首末级预筛**：任何完整对齐都必须让首级与末级块可行，取两者
+  可行区间交集后再枚举漂移。
 """
 
 from __future__ import annotations
@@ -59,12 +79,6 @@ class AlignmentError(ValueError):
 
 # 漂移闭区间允许的最大宽度（drift_max - drift_min）。
 DRIFT_WIDTH_MAX = 2000
-
-# (skipped, residual_sum, residual_max, drift, boundary_code)
-Cost = Tuple[int, int, int, int, int]
-
-# 状态：(代价, 前驱参考索引, 本级停留长度)；首级前驱为 -1。
-State = Optional[Tuple[Cost, int, int]]
 
 _BOUNDARY_BASE = 64  # 必须 > 最大观测数 60
 
@@ -119,8 +133,589 @@ def solve_alignment(
                 cs = tuple(observations[t] - ri for t in range(s, j))
                 blocks[(i, j, L)] = (max(cs) - lim, min(cs) + lim, cs)
 
+    intervals = _drift_candidate_intervals(
+        blocks, R, N, dwell_min, dwell_max, max_skips
+    )
+    drift_ranges = _enumerate_int_intervals(
+        intervals, drift_min, drift_max
+    )
+
+    # 每个 (i) 的 j 可行窗口与最邻近前驱索引下界（各阶段共用）。
+    windows: List[Tuple[int, int, int]] = []
+    later_levels_min: List[int] = []
+    later_levels_max: List[int] = []
+    for i in range(R):
+        if i == R - 1:
+            later_levels_min.append(0)
+        else:
+            later_levels_min.append(max(1, R - 1 - i - max_skips))
+        later_levels_max.append(R - 1 - i)
+    for i in range(1, R):
+        used_before_min = i - min(max_skips, max(0, i - 1))
+        j_lo = max(
+            (used_before_min + 1) * dwell_min,
+            N - later_levels_max[i] * dwell_max,
+        )
+        j_hi = min(
+            N,
+            (i + 1) * dwell_max,
+            N - later_levels_min[i] * dwell_min,
+        )
+        p_lo = max(0, i - max_skips - 1)
+        windows.append((j_lo, j_hi, p_lo))
+
+    # ---------- 阶段 A：最小化 (跳过数, 残差和)，两目标均可加 ----------
+    # finals_a[d] = grid[N][R-1] = {q: 最小残差和}
+    finals_a: Dict[int, Dict[int, int]] = {}
+    best_skips_sum: Optional[Tuple[int, int]] = None
+    for drift_range in drift_ranges:
+        for d in drift_range:
+            grid = _stage_min_skips_sum(
+                blocks, R, N, d, dwell_min, dwell_max, max_skips, windows
+            )
+            final_cell = grid[N][R - 1]
+            if final_cell is not None:
+                finals_a[d] = final_cell
+                for q, s in final_cell.items():
+                    candidate = (R - q, s)
+                    if (
+                        best_skips_sum is None
+                        or candidate < best_skips_sum
+                    ):
+                        best_skips_sum = candidate
+
+    if best_skips_sum is None:
+        return _infeasible_result()
+
+    star_skips, star_sum = best_skips_sum
+    star_levels = R - star_skips
+
+    # ---------- 阶段 B：固定 S*/T*，最小化最大残差，再最小化漂移 ----------
+    best_max_drift: Optional[Tuple[int, int]] = None
+    suffix_for_winner: Optional[_SuffixMinSum] = None
+    for drift_range in drift_ranges:
+        for d in drift_range:
+            final_cell = finals_a.get(d)
+            if final_cell is None or final_cell.get(star_levels) != star_sum:
+                continue
+            incumbent = (
+                best_max_drift[0] if best_max_drift is not None else None
+            )
+            # 无残差和约束的最大残差 DP 给出合法下界；下界都不能严格
+            # 击败当前最优时（平局归更小漂移），本漂移无需精确计算。
+            free_max = _stage_free_max(
+                blocks, R, N, d, dwell_min, dwell_max, max_skips,
+                windows, star_levels, incumbent,
+            )
+            if free_max is None:
+                continue
+            suffix = _SuffixMinSum(
+                blocks, R, N, d, dwell_min, dwell_max, max_skips
+            )
+            star_max = _stage_exact_max(
+                blocks, R, N, d, dwell_min, dwell_max, max_skips, windows,
+                star_levels, star_sum, incumbent, suffix,
+            )
+            if star_max is not None and (
+                best_max_drift is None or star_max < best_max_drift[0]
+            ):
+                best_max_drift = (star_max, d)
+                suffix_for_winner = suffix
+
+    if best_max_drift is None or suffix_for_winner is None:
+        # 理论不可达：阶段 A 确认可行时阶段 B 必能恢复同一方案。
+        return _infeasible_result()
+
+    star_max, star_drift = best_max_drift
+
+    # ---------- 阶段 C：固定全部标量目标，最小化边界序列字典序 ----------
+    used_indices, dwells, boundary_code = _stage_min_boundaries(
+        blocks, R, N, dwell_min, dwell_max, max_skips, windows,
+        star_levels, star_sum, star_max, star_drift, suffix_for_winner,
+    )
+
+    cost = (star_skips, star_sum, star_max, star_drift, boundary_code)
+    return _build_result(
+        reference, observations, cost, used_indices, dwells
+    )
+
+
+def _stage_min_skips_sum(
+    blocks: Dict[Tuple[int, int, int], Tuple[int, int, Tuple[int, ...]]],
+    R: int,
+    N: int,
+    d: int,
+    dwell_min: int,
+    dwell_max: int,
+    max_skips: int,
+    windows: Sequence[Tuple[int, int, int]],
+) -> List[List[Optional[Dict[int, int]]]]:
+    """阶段 A：grid[j][i] = {采用级数 q: 最小残差绝对和}。"""
+    grid: List[List[Optional[Dict[int, int]]]] = [
+        [None] * R for _ in range(N + 1)
+    ]
+
+    # 首级 i = 0。
+    for j in range(dwell_min, min(dwell_max, N) + 1):
+        lo, hi, cs = blocks[(0, j, j)]
+        if lo <= d <= hi:
+            grid[j][0] = {1: _abs_sum(cs, d)}
+
+    for i, (j_lo, j_hi, p_lo) in enumerate(windows, start=1):
+        if j_lo > j_hi:
+            continue
+        for j in range(j_lo, j_hi + 1):
+            cell: Optional[Dict[int, int]] = None
+            for L in range(dwell_min, min(dwell_max, j) + 1):
+                prev_j = j - L
+                if prev_j <= 0:
+                    continue
+                lo, hi, cs = blocks[(i, j, L)]
+                if not (lo <= d <= hi):
+                    continue
+                block_sum = _abs_sum(cs, d)
+                for p in range(i - 1, p_lo - 1, -1):
+                    prev_cell = grid[prev_j][p]
+                    if prev_cell is None:
+                        continue
+                    for pq, prev_sum in prev_cell.items():
+                        q = pq + 1
+                        if i + 1 - q > max_skips:
+                            continue
+                        new_sum = prev_sum + block_sum
+                        if cell is None:
+                            cell = {}
+                        old = cell.get(q)
+                        if old is None or new_sum < old:
+                            cell[q] = new_sum
+            if cell is not None:
+                grid[j][i] = cell
+    return grid
+
+
+def _stage_free_max(
+    blocks,
+    R: int,
+    N: int,
+    d: int,
+    dwell_min: int,
+    dwell_max: int,
+    max_skips: int,
+    windows,
+    star_levels: int,
+    incumbent: Optional[int],
+) -> Optional[int]:
+    """无残差和约束下、级数恰为 star_levels 时的最小最大绝对残差。
+
+    结果是“残差和=T* 约束下最大残差”的合法下界。``incumbent`` 非空时
+    严格剪去前缀最大残差已 >= incumbent 的状态：最大残差单调不减，
+    这些方案不可能严格优于当前最优（平局归更小漂移）。
+    """
+    grid: List[List[Optional[Dict[int, int]]]] = [
+        [None] * R for _ in range(N + 1)
+    ]
+
+    for j in range(dwell_min, min(dwell_max, N) + 1):
+        lo, hi, cs = blocks[(0, j, j)]
+        if lo <= d <= hi:
+            bmax = _abs_max(cs, d)
+            if incumbent is None or bmax < incumbent:
+                grid[j][0] = {1: bmax}
+
+    for i, (j_lo, j_hi, p_lo) in enumerate(windows, start=1):
+        if j_lo > j_hi:
+            continue
+        for j in range(j_lo, j_hi + 1):
+            cell: Optional[Dict[int, int]] = None
+            for L in range(dwell_min, min(dwell_max, j) + 1):
+                prev_j = j - L
+                if prev_j <= 0:
+                    continue
+                lo, hi, cs = blocks[(i, j, L)]
+                if not (lo <= d <= hi):
+                    continue
+                bmax = _abs_max(cs, d)
+                if incumbent is not None and bmax >= incumbent:
+                    continue
+                for p in range(i - 1, p_lo - 1, -1):
+                    prev_cell = grid[prev_j][p]
+                    if prev_cell is None:
+                        continue
+                    for pq, prev_max in prev_cell.items():
+                        q = pq + 1
+                        if i + 1 - q > max_skips:
+                            continue
+                        new_max = (
+                            prev_max if prev_max >= bmax else bmax
+                        )
+                        if incumbent is not None and new_max >= incumbent:
+                            continue
+                        if cell is None:
+                            cell = {}
+                        old = cell.get(q)
+                        if old is None or new_max < old:
+                            cell[q] = new_max
+            if cell is not None:
+                grid[j][i] = cell
+
+    final_cell = grid[N][R - 1]
+    if final_cell is None:
+        return None
+    return final_cell.get(star_levels)
+
+
+def _stage_exact_max(
+    blocks,
+    R: int,
+    N: int,
+    d: int,
+    dwell_min: int,
+    dwell_max: int,
+    max_skips: int,
+    windows,
+    star_levels: int,
+    star_sum: int,
+    incumbent: Optional[int],
+    suffix: "_SuffixMinSum",
+) -> Optional[int]:
+    """阶段 B：在级数=star_levels、残差和=star_sum 下求最小最大残差。
+
+    grid[j][i] = {q: {前缀残差和: 最小前缀最大残差}}。前缀和不同的
+    方案需要不同后缀和，互不支配，故按前缀和分桶。
+    """
+    grid: List[List[Optional[Dict[int, Dict[int, int]]]]] = [
+        [None] * R for _ in range(N + 1)
+    ]
+
+    for j in range(dwell_min, min(dwell_max, N) + 1):
+        lo, hi, cs = blocks[(0, j, j)]
+        if lo <= d <= hi:
+            bsum = _abs_sum(cs, d)
+            bmax = _abs_max(cs, d)
+            if bsum <= star_sum and (
+                incumbent is None or bmax < incumbent
+            ):
+                grid[j][0] = {1: {bsum: bmax}}
+
+    for i, (j_lo, j_hi, p_lo) in enumerate(windows, start=1):
+        if j_lo > j_hi:
+            continue
+        for j in range(j_lo, j_hi + 1):
+            merged: Optional[Dict[int, Dict[int, int]]] = None
+            suffix_lb = suffix.get(j, i)
+            for L in range(dwell_min, min(dwell_max, j) + 1):
+                prev_j = j - L
+                if prev_j <= 0:
+                    continue
+                lo, hi, cs = blocks[(i, j, L)]
+                if not (lo <= d <= hi):
+                    continue
+                block_sum = _abs_sum(cs, d)
+                block_max = _abs_max(cs, d)
+                if incumbent is not None and block_max >= incumbent:
+                    continue
+                for p in range(i - 1, p_lo - 1, -1):
+                    prev_cell = grid[prev_j][p]
+                    if prev_cell is None:
+                        continue
+                    for pq, sums in prev_cell.items():
+                        q = pq + 1
+                        if i + 1 - q > max_skips:
+                            continue
+                        for prefix_sum, prefix_max in sums.items():
+                            new_sum = prefix_sum + block_sum
+                            if new_sum > star_sum:
+                                continue
+                            new_max = (
+                                prefix_max
+                                if prefix_max >= block_max
+                                else block_max
+                            )
+                            if (
+                                incumbent is not None
+                                and new_max >= incumbent
+                            ):
+                                continue
+                            if merged is None:
+                                merged = {}
+                            by_sum = merged.setdefault(q, {})
+                            old = by_sum.get(new_sum)
+                            if old is None or new_max < old:
+                                by_sum[new_sum] = new_max
+            if merged is not None and suffix_lb is not None:
+                pruned: Dict[int, Dict[int, int]] = {}
+                for q, by_sum in merged.items():
+                    kept = {
+                        s: m
+                        for s, m in by_sum.items()
+                        if s + suffix_lb <= star_sum
+                    }
+                    if kept:
+                        pruned[q] = kept
+                if pruned:
+                    grid[j][i] = pruned
+    final_cell = grid[N][R - 1]
+    if final_cell is None or star_levels not in final_cell:
+        return None
+    return final_cell[star_levels].get(star_sum)
+
+
+class _PathNode:
+    """阶段 C 前缀节点：保留 Pareto 状态与回溯指针。"""
+
+    __slots__ = (
+        "prefix_max",
+        "code",
+        "skipped",
+        "prev",
+        "level",
+        "dwell",
+    )
+
+    def __init__(
+        self,
+        prefix_max: int,
+        code: int,
+        skipped: Tuple[int, ...],
+        prev: Optional["_PathNode"],
+        level: int,
+        dwell: int,
+    ) -> None:
+        self.prefix_max = prefix_max
+        self.code = code
+        self.skipped = skipped
+        self.prev = prev
+        self.level = level
+        self.dwell = dwell
+
+
+def _stage_min_boundaries(
+    blocks,
+    R: int,
+    N: int,
+    dwell_min: int,
+    dwell_max: int,
+    max_skips: int,
+    windows,
+    star_levels: int,
+    star_sum: int,
+    star_max: int,
+    d: int,
+    suffix: "_SuffixMinSum",
+) -> Tuple[List[int], List[int], int]:
+    """阶段 C：固定 S*/T*/M*/D*，求字典序最小边界并回溯。
+
+    grid[j][i] = {q: {前缀残差和: [_PathNode  Pareto 前沿]}}；
+    节点按 (前缀最大, 边界编码, 跳过索引元组) 三元组互相支配。
+    """
+    grid: List[List[Optional[Dict[int, Dict[int, List[_PathNode]]]]]] = [
+        [None] * R for _ in range(N + 1)
+    ]
+
+    def insert(by_sum: Dict[int, List[_PathNode]], s: int, node: _PathNode) -> None:
+        front = by_sum.get(s)
+        if front is None:
+            by_sum[s] = [node]
+            return
+        for other in front:
+            if (
+                other.prefix_max <= node.prefix_max
+                and other.code <= node.code
+                and other.skipped <= node.skipped
+            ):
+                return
+        front[:] = [
+            other
+            for other in front
+            if not (
+                node.prefix_max <= other.prefix_max
+                and node.code <= other.code
+                and node.skipped <= other.skipped
+            )
+        ]
+        front.append(node)
+
+    for j in range(dwell_min, min(dwell_max, N) + 1):
+        lo, hi, cs = blocks[(0, j, j)]
+        if lo <= d <= hi:
+            bsum = _abs_sum(cs, d)
+            bmax = _abs_max(cs, d)
+            if bsum <= star_sum and bmax <= star_max:
+                node = _PathNode(bmax, j, (), None, 0, j)
+                grid[j][0] = {1: {bsum: [node]}}
+
+    for i, (j_lo, j_hi, p_lo) in enumerate(windows, start=1):
+        if j_lo > j_hi:
+            continue
+        for j in range(j_lo, j_hi + 1):
+            merged: Optional[Dict[int, Dict[int, List[_PathNode]]]] = None
+            suffix_lb = suffix.get(j, i)
+            for L in range(dwell_min, min(dwell_max, j) + 1):
+                prev_j = j - L
+                if prev_j <= 0:
+                    continue
+                lo, hi, cs = blocks[(i, j, L)]
+                if not (lo <= d <= hi):
+                    continue
+                block_sum = _abs_sum(cs, d)
+                block_max = _abs_max(cs, d)
+                if block_max > star_max:
+                    continue
+                for p in range(i - 1, p_lo - 1, -1):
+                    prev_cell = grid[prev_j][p]
+                    if prev_cell is None:
+                        continue
+                    gap_skips = tuple(range(p + 1, i))
+                    for pq, sums in prev_cell.items():
+                        q = pq + 1
+                        if i + 1 - q > max_skips:
+                            continue
+                        for prefix_sum, front in sums.items():
+                            new_sum = prefix_sum + block_sum
+                            if new_sum > star_sum:
+                                continue
+                            for prev_node in front:
+                                new_max = (
+                                    prev_node.prefix_max
+                                    if prev_node.prefix_max >= block_max
+                                    else block_max
+                                )
+                                if new_max > star_max:
+                                    continue
+                                if merged is None:
+                                    merged = {}
+                                node = _PathNode(
+                                    new_max,
+                                    prev_node.code * _BOUNDARY_BASE + j,
+                                    prev_node.skipped + gap_skips,
+                                    prev_node,
+                                    i,
+                                    L,
+                                )
+                                insert(merged.setdefault(q, {}), new_sum, node)
+            if merged is not None and suffix_lb is not None:
+                pruned: Dict[int, Dict[int, List[_PathNode]]] = {}
+                for q, by_sum in merged.items():
+                    kept = {
+                        s: front
+                        for s, front in by_sum.items()
+                        if s + suffix_lb <= star_sum
+                    }
+                    if kept:
+                        pruned[q] = kept
+                if pruned:
+                    grid[j][i] = pruned
+
+    final_cell = grid[N][R - 1]
+    assert final_cell is not None and star_levels in final_cell
+    front = final_cell[star_levels][star_sum]
+    winner = min(
+        front,
+        key=lambda node: (node.prefix_max, node.code, node.skipped),
+    )
+
+    used_indices: List[int] = []
+    dwells: List[int] = []
+    node: Optional[_PathNode] = winner
+    while node is not None:
+        used_indices.append(node.level)
+        dwells.append(node.dwell)
+        node = node.prev
+    used_indices.reverse()
+    dwells.reverse()
+    return used_indices, dwells, winner.code
+
+
+class _SuffixMinSum:
+    """放宽的后缀最小残差和（记忆化），仅作前缀剪枝下界。
+
+    值 ``get(j, i)`` 为：观测前缀已结束于 (j, i) 时，铺完 O[j..N) 并以
+    R[R-1] 收尾所需的最小残差和；允许任意不超过 max_skips 的相邻跳过、
+    不计采用级数。该放宽使结果始终是真实最优后缀和的下界，故
+    ``前缀和 + 下界 > T*`` 的剪枝不会误删任何可行方案。
+    """
+
+    def __init__(
+        self,
+        blocks: Dict[Tuple[int, int, int], Tuple[int, int, Tuple[int, ...]]],
+        R: int,
+        N: int,
+        d: int,
+        dwell_min: int,
+        dwell_max: int,
+        max_skips: int,
+    ) -> None:
+        self._blocks = blocks
+        self._R = R
+        self._N = N
+        self._d = d
+        self._dwell_min = dwell_min
+        self._dwell_max = dwell_max
+        self._max_skips = max_skips
+        self._memo: Dict[Tuple[int, int], Optional[int]] = {}
+
+    def get(self, j: int, i: int) -> Optional[int]:
+        key = (j, i)
+        cached = self._memo.get(key)
+        if key in self._memo:
+            return cached
+        R = self._R
+        N = self._N
+        if i == R - 1:
+            value = 0 if j == N else None
+            self._memo[key] = value
+            return value
+
+        best: Optional[int] = None
+        k_hi = min(R - 1, i + 1 + self._max_skips)
+        for k in range(i + 1, k_hi + 1):
+            for L in range(self._dwell_min, min(self._dwell_max, N - j) + 1):
+                end = j + L
+                later = self.get(end, k)
+                if later is None:
+                    continue
+                lo, hi, cs = self._blocks[(k, end, L)]
+                if not (lo <= self._d <= hi):
+                    continue
+                value = _abs_sum(cs, self._d) + later
+                if best is None or value < best:
+                    best = value
+        self._memo[key] = best
+        return best
+
+
+def _abs_sum(cs: Sequence[int], drift: int) -> int:
+    """块内残差绝对和（块长 <= 3）。"""
+    total = 0
+    for c in cs:
+        r = c - drift
+        total += r if r >= 0 else -r
+    return total
+
+
+def _abs_max(cs: Sequence[int], drift: int) -> int:
+    """块内最大绝对残差（块长 <= 3）。"""
+    worst = 0
+    for c in cs:
+        r = c - drift
+        if r < 0:
+            r = -r
+        if r > worst:
+            worst = r
+    return worst
+
+
+def _drift_candidate_intervals(
+    blocks: Dict[Tuple[int, int, int], Tuple[int, int, Tuple[int, ...]]],
+    R: int,
+    N: int,
+    dwell_min: int,
+    dwell_max: int,
+    max_skips: int,
+) -> List[Tuple[int, int]]:
+    """首、末级块可行漂移区间的交集（与请求漂移闭区间再取交）。"""
+
     def first_block_intervals() -> List[Tuple[int, int]]:
-        # 首级停留 j 个采样后，余下观测必须还能铺够最少末前级数。
         later_min = max(1, R - 1 - max_skips)
         out = []
         for j in range(dwell_min, dwell_max + 1):
@@ -141,118 +736,9 @@ def solve_alignment(
             out.append((lo, hi))
         return _merge_intervals(out)
 
-    intervals = _intersect_interval_lists(
+    return _intersect_interval_lists(
         first_block_intervals(), last_block_intervals()
     )
-    drift_ranges = _enumerate_int_intervals(
-        intervals, drift_min, drift_max
-    )
-
-    best_cost: Optional[Cost] = None
-    best_solution: Optional[Tuple[List[int], List[int]]] = None
-
-    # 每个 (i, j) 的合法级数范围推导用的观测数上下界。
-    later_levels_min: List[int] = []
-    later_levels_max: List[int] = []
-    for i in range(R):
-        if i == R - 1:
-            later_levels_min.append(0)
-        else:
-            later_levels_min.append(max(1, R - 1 - i - max_skips))
-        later_levels_max.append(R - 1 - i)
-
-    for drift_range in drift_ranges:
-        for d in drift_range:
-            grid: List[List[State]] = [
-                [None] * R for _ in range(N + 1)
-            ]
-
-            # 首级 i = 0。
-            for j in range(dwell_min, min(dwell_max, N) + 1):
-                lo, hi, cs = blocks[(0, j, j)]
-                if not (lo <= d <= hi):
-                    continue
-                bsum, bmax = _block_stats(cs, d)
-                cand: Cost = (0, bsum, bmax, d, j)
-                if grid[j][0] is None or cand < grid[j][0][0]:  # type: ignore[index]
-                    grid[j][0] = (cand, -1, j)
-
-            # 后续级。
-            for i in range(1, R):
-                p_lo = max(0, i - max_skips - 1)
-                used_before_min = i - min(max_skips, max(0, i - 1))
-                used_before_max = i
-                # 含本级在内至少/至多消耗的观测数，同时保证余下观测数
-                # 足以容纳后续最少/最多级数。
-                j_lo = max(
-                    (used_before_min + 1) * dwell_min,
-                    N - later_levels_max[i] * dwell_max,
-                )
-                j_hi = min(
-                    N,
-                    (used_before_max + 1) * dwell_max,
-                    N - later_levels_min[i] * dwell_min,
-                )
-                if j_lo > j_hi:
-                    continue
-                for j in range(j_lo, j_hi + 1):
-                    best: Optional[Tuple[Cost, int, int]] = None
-                    for L in range(dwell_min, min(dwell_max, j) + 1):
-                        prev_j = j - L
-                        if prev_j <= 0:
-                            continue
-                        lo, hi, cs = blocks[(i, j, L)]
-                        if not (lo <= d <= hi):
-                            continue
-                        bsum, bmax = _block_stats(cs, d)
-                        for p in range(i - 1, p_lo - 1, -1):
-                            prev = grid[prev_j][p]
-                            if prev is None:
-                                continue
-                            pcost = prev[0]
-                            new_skipped = pcost[0] + (i - p - 1)
-                            if new_skipped > max_skips:
-                                continue
-                            cand = (
-                                new_skipped,
-                                pcost[1] + bsum,
-                                pcost[2] if pcost[2] >= bmax else bmax,
-                                d,
-                                pcost[4] * _BOUNDARY_BASE + j,
-                            )
-                            if best is None or cand < best[0]:
-                                best = (cand, p, L)
-                    if best is not None:
-                        cur = grid[j][i]
-                        if cur is None or best[0] < cur[0]:
-                            grid[j][i] = best
-
-            final_state = grid[N][R - 1]
-            if final_state is not None and (
-                best_cost is None or final_state[0] < best_cost
-            ):
-                best_cost = final_state[0]
-                best_solution = _backtrack(grid, N, R - 1)
-
-    if best_cost is None or best_solution is None:
-        return _infeasible_result()
-
-    used_indices, dwells = best_solution
-    return _build_result(
-        reference, observations, best_cost, used_indices, dwells
-    )
-
-
-def _block_stats(cs: Tuple[int, ...], drift: int) -> Tuple[int, int]:
-    """块内残差绝对和与最大绝对残差（块长 <= 3）。"""
-    total = 0
-    worst = 0
-    for c in cs:
-        ar = abs(c - drift)
-        total += ar
-        if ar > worst:
-            worst = ar
-    return total, worst
 
 
 def _merge_intervals(
@@ -304,33 +790,10 @@ def _enumerate_int_intervals(
     return result
 
 
-def _backtrack(
-    grid: List[List[State]], end_j: int, end_i: int
-) -> Tuple[List[int], List[int]]:
-    """沿状态指针回溯，返回 (采用参考索引序列, 逐级停留长度)。"""
-    j = end_j
-    i = end_i
-    rev_idx: List[int] = []
-    rev_dwell: List[int] = []
-    while True:
-        cur = grid[j][i]
-        assert cur is not None
-        _, prev_i, dwell = cur
-        rev_idx.append(i)
-        rev_dwell.append(dwell)
-        if prev_i < 0:
-            break
-        j -= dwell
-        i = prev_i
-    rev_idx.reverse()
-    rev_dwell.reverse()
-    return rev_idx, rev_dwell
-
-
 def _build_result(
     reference: Sequence[int],
     observations: Sequence[int],
-    cost: Cost,
+    cost: Tuple[int, int, int, int, int],
     used_indices: List[int],
     dwells: List[int],
 ) -> dict:
