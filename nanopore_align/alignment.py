@@ -37,15 +37,24 @@
   独立做一次 DP。``grid[j][i]`` 表示观测前缀 ``O[0..j)`` 恰好在参考
   电平 R[i] 结束时的最优代价；首级必须是 R[0]，末级必须是 R[R-1]，
   首尾因此强制必用。因最多 2 个内部跳过，前驱只需考虑 i-1/i-2/i-3。
+* **每状态保留 (最大残差, 边界码) 帕累托前沿**：跳过数与残差和对
+  任意后缀都是可加的，且从状态 ``(j, i)`` 出发的后缀可行性只取决于
+  已用跳过数，因此同一状态下 ``(跳过数, 残差和)`` 更大的前缀永远不
+  可能成为全局最优；但最大残差以 ``max`` 合成——前缀上更小的最大
+  残差可能被后缀的更大残差“抹平”，此时边界序列字典序才是裁决项。
+  故在最优 ``(跳过数, 残差和)`` 等级内保留全部互不支配的
+  ``(最大残差, 编码)`` 前沿点，而不是每状态只留单个最优。
 * **块可行区间预计算**：对采样块 [j-L, j) 归属 R[i]，令
   c_t = O[t] - R[i]，可行漂移为整数闭区间
   ``[max c_t - lim, min c_t + lim]``，与漂移无关，只算一次；
   每漂移仅做一次整数包含判断与至多 3 个残差的统计。
 * **首末级预筛**：任何完整对齐都必须让首级（含前 dwell_min 个观测）
   与末级块可行，取两者可行区间并集的交集再枚举漂移。
-* **边界序列编码**：边界均在 1..60，以 64 为基编码为单个整数，
-  同级数（同跳过数）下整数大小次序恰为边界序列字典序，
-  追加边界即 ``code = code * 64 + j``。
+* **边界与采用索引序列编码**：边界均在 1..60、参考索引在 0..23，
+  每经过一级追加一个基 4096 的“数位对” ``边界*64 + 参考索引``，
+  编码为单个整数：同级数（同跳过数）下整数大小次序恰为“边界序列
+  字典序、再参考索引序列字典序”，后者仅在边界序列完全相同时作为
+  最终确定性裁决；追加一级即 ``code = code*4096 + j*64 + i``。
 """
 
 from __future__ import annotations
@@ -63,10 +72,16 @@ DRIFT_WIDTH_MAX = 2000
 # (skipped, residual_sum, residual_max, drift, boundary_code)
 Cost = Tuple[int, int, int, int, int]
 
-# 状态：(代价, 前驱参考索引, 本级停留长度)；首级前驱为 -1。
-State = Optional[Tuple[Cost, int, int]]
+# 前沿点（同一状态、同一最优 (跳过数, 残差和) 等级内互不支配者）：
+#   (最大残差, 边界码, 前驱观测边界, 前驱参考索引, 前驱点序号, 本级停留)
+# 首级前驱参考索引为 -1、前驱点序号为 -1。
+Entry = Tuple[int, int, int, int, int, int]
 
-_BOUNDARY_BASE = 64  # 必须 > 最大观测数 60
+# 一个状态：最优 (跳过数, 残差和) 键 + (最大残差, 边界码) 帕累托前沿。
+State = Optional[Tuple[Tuple[int, int], List[Entry]]]
+
+_DIGIT_BASE = 4096  # 数位 = 边界*64 + 参考索引；须 > 60*64 + 23
+_BOUNDARY_BASE = 64  # 必须 > 最大参考索引数 24，且边界 <= 60
 
 
 def solve_alignment(
@@ -167,15 +182,14 @@ def solve_alignment(
                 [None] * R for _ in range(N + 1)
             ]
 
-            # 首级 i = 0。
+            # 首级 i = 0：每个可行停留长度对应一个前沿点。
             for j in range(dwell_min, min(dwell_max, N) + 1):
                 lo, hi, cs = blocks[(0, j, j)]
                 if not (lo <= d <= hi):
                     continue
                 bsum, bmax = _block_stats(cs, d)
-                cand: Cost = (0, bsum, bmax, d, j)
-                if grid[j][0] is None or cand < grid[j][0][0]:  # type: ignore[index]
-                    grid[j][0] = (cand, -1, j)
+                entry: Entry = (bmax, j * _BOUNDARY_BASE, 0, -1, -1, j)
+                grid[j][0] = ((0, bsum), [entry])
 
             # 后续级。
             for i in range(1, R):
@@ -196,7 +210,9 @@ def solve_alignment(
                 if j_lo > j_hi:
                     continue
                 for j in range(j_lo, j_hi + 1):
-                    best: Optional[Tuple[Cost, int, int]] = None
+                    # 最优 (跳过数, 残差和) 键，及其等级内的候选前沿点。
+                    best_key: Optional[Tuple[int, int]] = None
+                    candidates: List[Entry] = []
                     for L in range(dwell_min, min(dwell_max, j) + 1):
                         prev_j = j - L
                         if prev_j <= 0:
@@ -209,30 +225,44 @@ def solve_alignment(
                             prev = grid[prev_j][p]
                             if prev is None:
                                 continue
-                            pcost = prev[0]
-                            new_skipped = pcost[0] + (i - p - 1)
+                            (p_skip, p_sum), p_entries = prev
+                            new_skipped = p_skip + (i - p - 1)
                             if new_skipped > max_skips:
                                 continue
-                            cand = (
-                                new_skipped,
-                                pcost[1] + bsum,
-                                pcost[2] if pcost[2] >= bmax else bmax,
-                                d,
-                                pcost[4] * _BOUNDARY_BASE + j,
-                            )
-                            if best is None or cand < best[0]:
-                                best = (cand, p, L)
-                    if best is not None:
-                        cur = grid[j][i]
-                        if cur is None or best[0] < cur[0]:
-                            grid[j][i] = best
+                            key = (new_skipped, p_sum + bsum)
+                            if best_key is not None and key > best_key:
+                                continue
+                            digit = j * _BOUNDARY_BASE + i
+                            for e_idx, pe in enumerate(p_entries):
+                                rmax = (
+                                    pe[0] if pe[0] >= bmax else bmax
+                                )
+                                code = pe[1] * _DIGIT_BASE + digit
+                                entry = (
+                                    rmax, code, prev_j, p, e_idx, L
+                                )
+                                if best_key is None or key < best_key:
+                                    best_key = key
+                                    candidates = [entry]
+                                else:
+                                    candidates.append(entry)
+                    if candidates:
+                        grid[j][i] = (
+                            best_key,
+                            _pareto_frontier(candidates),
+                        )
 
             final_state = grid[N][R - 1]
-            if final_state is not None and (
-                best_cost is None or final_state[0] < best_cost
-            ):
-                best_cost = final_state[0]
-                best_solution = _backtrack(grid, N, R - 1)
+            if final_state is None:
+                continue
+            (f_skip, f_sum), f_entries = final_state
+            winner = min(f_entries, key=lambda e: (e[0], e[1]))
+            final_cost: Cost = (
+                f_skip, f_sum, winner[0], d, winner[1]
+            )
+            if best_cost is None or final_cost < best_cost:
+                best_cost = final_cost
+                best_solution = _backtrack(grid, N, R - 1, winner)
 
     if best_cost is None or best_solution is None:
         return _infeasible_result()
@@ -241,6 +271,25 @@ def solve_alignment(
     return _build_result(
         reference, observations, best_cost, used_indices, dwells
     )
+
+
+def _pareto_frontier(candidates: List[Entry]) -> List[Entry]:
+    """同一状态、同一 (跳过数, 残差和) 等级内的 (最大残差, 编码) 前沿。
+
+    候选 ``a`` 支配 ``b`` 当 ``a`` 的最大残差与编码都不大于 ``b``：
+    两者后缀完全相同（同状态、同已用跳过数），``max`` 合成下 ``a`` 在
+    任意后缀上都不会更差，且编码次序与后缀无关（数位等长，前缀编码
+    较小者追加任意相同后缀后仍然较小）。
+    """
+    # 最大残差升序、编码升序；扫描时只保留编码严格小于已见最小者的点。
+    ordered = sorted(candidates, key=lambda e: (e[0], e[1]))
+    frontier: List[Entry] = []
+    min_code: Optional[int] = None
+    for e in ordered:
+        if min_code is None or e[1] < min_code:
+            frontier.append(e)
+            min_code = e[1]
+    return frontier
 
 
 def _block_stats(cs: Tuple[int, ...], drift: int) -> Tuple[int, int]:
@@ -305,23 +354,28 @@ def _enumerate_int_intervals(
 
 
 def _backtrack(
-    grid: List[List[State]], end_j: int, end_i: int
+    grid: List[List[State]],
+    end_j: int,
+    end_i: int,
+    winner: Entry,
 ) -> Tuple[List[int], List[int]]:
-    """沿状态指针回溯，返回 (采用参考索引序列, 逐级停留长度)。"""
+    """沿前沿点指针回溯，返回 (采用参考索引序列, 逐级停留长度)。"""
     j = end_j
     i = end_i
+    entry: Optional[Entry] = winner
     rev_idx: List[int] = []
     rev_dwell: List[int] = []
-    while True:
-        cur = grid[j][i]
-        assert cur is not None
-        _, prev_i, dwell = cur
+    while entry is not None:
+        _, _, prev_j, prev_i, prev_eidx, dwell = entry
         rev_idx.append(i)
         rev_dwell.append(dwell)
         if prev_i < 0:
             break
-        j -= dwell
+        j = prev_j
         i = prev_i
+        prev_state = grid[j][i]
+        assert prev_state is not None
+        entry = prev_state[1][prev_eidx]
     rev_idx.reverse()
     rev_dwell.reverse()
     return rev_idx, rev_dwell

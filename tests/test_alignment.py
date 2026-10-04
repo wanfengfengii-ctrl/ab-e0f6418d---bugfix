@@ -58,20 +58,34 @@ def brute_force(
                         s += L
                     if not ok:
                         continue
-                    cost = (skip_count, total, worst, d, boundaries)
+                    cost = (
+                        skip_count,
+                        total,
+                        worst,
+                        d,
+                        boundaries[:-1],
+                        tuple(used),
+                    )
                     if best is None or cost < best[0]:
                         best = (cost, used, d)
 
     if best is None:
         return None
-    (skipped_n, total, worst, d, boundaries), used, drift = best
+    (
+        skipped_n,
+        total,
+        worst,
+        d,
+        inner_boundaries,
+        used_tuple,
+    ), used, drift = best
     return {
         "feasible": True,
         "drift": drift,
         "num_skips": skipped_n,
         "residual_sum": total,
         "max_abs_residual": worst,
-        "boundaries": list(boundaries[:-1]),
+        "boundaries": list(inner_boundaries),
         "used_indices": list(used),
     }
 
@@ -274,6 +288,34 @@ class ObjectiveOrderTests(unittest.TestCase):
         # 内部边界字典序最小。
         self.assertEqual(res["boundaries"], [1, 2, 3, 4, 5, 6, 7])
 
+    def test_full_tie_lexicographic_boundaries_regression(self) -> None:
+        # 回归：跳过数、残差和（28）、最大残差（7）、漂移（0）全部并列时，
+        # 旧实现每状态只保留单一前缀最优，丢弃了“前缀最大残差较大但边界
+        # 码更小”的候选；末级残差 7 抹平前缀差异后该候选才是全局字典序
+        # 最优，旧实现错误返回 [1,2,4,5,6,7,8]。
+        ref = [0, 1, 2, 3, 4, 5, 6, 7]
+        obs = [2, 4, 2, -1, -1, 8, 9, 5, 0]
+        res = solve_alignment(
+            ref, obs, 0, 0, 7, dwell_min=1, dwell_max=3, max_skips=0
+        )
+        self.assertTrue(res["feasible"])
+        self.assertEqual(res["drift"], 0)
+        self.assertEqual(res["num_skips"], 0)
+        self.assertEqual(res["residual_sum"], 28)
+        self.assertEqual(res["max_abs_residual"], 7)
+        self.assertEqual(res["boundaries"], [1, 2, 3, 4, 5, 6, 8])
+        self.assertEqual(
+            [lv["reference_index"] for lv in res["levels"]],
+            list(range(8)),
+        )
+        # 残差证据完整互斥覆盖全部观测。
+        covered = [
+            s["index"]
+            for lv in res["levels"]
+            for s in lv["samples"]
+        ]
+        self.assertEqual(covered, list(range(len(obs))))
+
 
 class ValidationTests(unittest.TestCase):
     def _base(self) -> dict:
@@ -400,26 +442,26 @@ class BruteForceComparisonTests(unittest.TestCase):
 
     def test_random_cases(self) -> None:
         rng = random.Random(20261004)
-        for trial in range(120):
+        dwell_combos = [(1, 1), (1, 2), (1, 3), (2, 2), (2, 3), (3, 3)]
+        for trial in range(160):
             R = rng.randint(8, 10)
             N = rng.randint(8, 14)
             ref = [rng.randint(0, 40) for _ in range(R)]
+            dwell_min, dwell_max = rng.choice(dwell_combos)
+            cap = rng.choice([0, 1, 2])
             # 先随机生成一个“真值”对齐，再对部分观测加入噪声，
             # 保证可行与不可行实例混合出现。
-            used = [0]
             inner = list(range(1, R - 1))
             rng.shuffle(inner)
-            # 随机跳过 0..2 个内部电平
-            skip_k = rng.randint(0, min(2, R - 2))
+            # 随机跳过 0..cap 个内部电平
+            skip_k = rng.randint(0, min(cap, R - 2))
             skipped_set = set(inner[:skip_k])
             used = [i for i in range(R) if i not in skipped_set]
             k = len(used)
-            if k > N:
-                used = list(range(R))
-                k = R
-                skipped_set = set()
-            # 随机停留组合，和为 N，每段 1..3
-            dwells = self._random_composition(rng, k, N, 1, 3)
+            # 随机停留组合，和为 N，每段在本轮停留范围内。
+            dwells = self._random_composition(
+                rng, k, N, dwell_min, dwell_max
+            )
             if dwells is None:
                 continue
             d = rng.randint(-3, 3)
@@ -430,12 +472,40 @@ class BruteForceComparisonTests(unittest.TestCase):
                     noise = rng.choice([0, 0, 0, 1, -1, 2, -2, 5])
                     obs.append(level + noise)
             limit = rng.choice([0, 1, 2, 3, 10])
-            d_lo = d - rng.randint(0, 3)
-            d_hi = d + rng.randint(0, 3)
+            width = rng.choice([0, 1, 3, 8])
+            d_lo = d - rng.randint(0, width)
+            d_hi = d + rng.randint(0, width)
             with self.subTest(trial=trial, ref=ref, obs=obs,
-                              lo=d_lo, hi=d_hi, limit=limit):
+                              lo=d_lo, hi=d_hi, limit=limit,
+                              dwell=(dwell_min, dwell_max), cap=cap):
                 _assert_matches_brute(
-                    self, ref, obs, d_lo, d_hi, limit, 1, 3, 2
+                    self, ref, obs, d_lo, d_hi, limit,
+                    dwell_min, dwell_max, cap
+                )
+
+    def test_random_duplicate_level_cases(self) -> None:
+        # 大量重复参考电平：边界序列相同但跳过的内部索引不同的并列极易
+        # 出现，用于检验“边界 → 采用索引序列”的最终确定性裁决，以及
+        # 非可加的最大残差目标下每状态帕累托前沿的正确性。
+        rng = random.Random(7777)
+        dwell_combos = [(1, 1), (1, 2), (1, 3), (2, 3)]
+        for trial in range(120):
+            R = rng.randint(8, 10)
+            N = rng.randint(8, 14)
+            ref = [rng.randint(0, 5) for _ in range(R)]
+            obs = [rng.randint(0, 9) for _ in range(N)]
+            dwell_min, dwell_max = rng.choice(dwell_combos)
+            cap = rng.choice([0, 1, 2])
+            limit = rng.choice([0, 1, 2, 3, 5])
+            width = rng.choice([0, 2, 5])
+            d_lo = -width
+            d_hi = width
+            with self.subTest(trial=trial, ref=ref, obs=obs,
+                              lo=d_lo, hi=d_hi, limit=limit,
+                              dwell=(dwell_min, dwell_max), cap=cap):
+                _assert_matches_brute(
+                    self, ref, obs, d_lo, d_hi, limit,
+                    dwell_min, dwell_max, cap
                 )
 
     @staticmethod
